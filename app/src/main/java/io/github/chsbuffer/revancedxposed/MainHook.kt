@@ -1,13 +1,8 @@
 package io.github.chsbuffer.revancedxposed
 
-import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Application
-import android.content.Context
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
+import android.view.ViewGroup
 import android.view.HapticFeedbackConstants
 import android.view.View
 import app.revanced.extension.shared.Utils
@@ -24,7 +19,7 @@ import io.github.chsbuffer.revancedxposed.spotify.SettingsSheet
 import io.github.chsbuffer.revancedxposed.spotify.SpotifyHook
 import io.github.chsbuffer.revancedxposed.spotify.ThemeHook
 import java.util.WeakHashMap
-import kotlin.math.sqrt
+// ...existing imports...
 
 class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     lateinit var startupParam: StartupParam
@@ -35,8 +30,8 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         "com.spotify.music" to { SpotifyHook(app, lpparam) },
     )
 
-    // Keep track of our sensor listeners so we can unregister them when the app pauses
-    private val shakeListeners = WeakHashMap<Activity, ShakeListener>()
+    // Keep track of the anchor view (home tab) so we can remove the listener when the app pauses
+    private val anchorViews = WeakHashMap<Activity, View>()
 
     fun shouldHook(packageName: String): Boolean {
         if (!hooksByPackage.containsKey(packageName)) return false
@@ -59,17 +54,34 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     val activity = param.thisObject as Activity
                     if (!activity.javaClass.name.contains("MainActivity")) return
 
-                    val sensorManager = activity.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-                    val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-
-                    if (accelerometer != null) {
-                        var listener = shakeListeners[activity]
-                        if (listener == null) {
-                            listener = ShakeListener(activity)
-                            shakeListeners[activity] = listener
+                    // Find the Spotify bottom "home" tab (or best-effort candidate) and attach a long-press listener
+                    val decorView = activity.window.decorView
+                    val candidate = findHomeTab(decorView)
+                    if (candidate != null) {
+                        // Avoid re-attaching if already attached
+                        val existing = anchorViews[activity]
+                        if (existing !== candidate) {
+                            // Remove listener from previous if any
+                            existing?.setOnLongClickListener(null)
+                            candidate.setOnLongClickListener { v ->
+                                v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                SettingsSheet.show(activity, v)
+                                true
+                            }
+                            anchorViews[activity] = candidate
                         }
-                        // SENSOR_DELAY_UI is responsive enough for a shake without killing the battery
-                        sensorManager.registerListener(listener, accelerometer, SensorManager.SENSOR_DELAY_UI)
+                    } else {
+                        // Fallback: attach to decorView center so user can long-press anywhere
+                        val existing = anchorViews[activity]
+                        if (existing != decorView) {
+                            existing?.setOnLongClickListener(null)
+                            decorView.setOnLongClickListener { v ->
+                                v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                                SettingsSheet.show(activity, v)
+                                true
+                            }
+                            anchorViews[activity] = decorView
+                        }
                     }
                 }
             }
@@ -85,10 +97,10 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     val activity = param.thisObject as Activity
                     if (!activity.javaClass.name.contains("MainActivity")) return
 
-                    val listener = shakeListeners[activity]
-                    if (listener != null) {
-                        val sensorManager = activity.getSystemService(Context.SENSOR_SERVICE) as SensorManager
-                        sensorManager.unregisterListener(listener)
+                    val anchor = anchorViews[activity]
+                    if (anchor != null) {
+                        anchor.setOnLongClickListener(null)
+                        anchorViews.remove(activity)
                     }
                 }
             }
@@ -161,43 +173,29 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         this.startupParam = startupParam
     }
 
-    // --- CLASSE SHAKE LISTENER ---
-    private class ShakeListener(private val activity: Activity) : SensorEventListener {
-        // Adjust this threshold to make the shake more or less sensitive (2.7f is standard)
-        private val SHAKE_THRESHOLD_GRAVITY = 2.7f
-        private val SHAKE_SLOP_TIME_MS = 1000 // 1 second cooldown between shakes
-        private var mShakeTimestamp: Long = 0
+    // ...existing code...
 
-        override fun onSensorChanged(event: SensorEvent) {
-            val x = event.values[0]
-            val y = event.values[1]
-            val z = event.values[2]
+    // Walk view hierarchy to find a likely "home" bottom tab candidate
+    private fun findHomeTab(root: View): View? {
+        try {
+            val resName = if (root.id != View.NO_ID) try { root.resources.getResourceEntryName(root.id) } catch (_: Exception) { "" } else ""
+            val className = root.javaClass.name.lowercase()
 
-            val gX = x / SensorManager.GRAVITY_EARTH
-            val gY = y / SensorManager.GRAVITY_EARTH
-            val gZ = z / SensorManager.GRAVITY_EARTH
+            // Heuristics: resource name containing these substrings or class name hints
+            val matchesName = listOf("home", "browse", "evopage", "nav", "navigation", "bottom", "tab").any { resName.contains(it) }
+            val matchesClass = listOf("navigation", "bottom", "tab", "evopage").any { className.contains(it) }
 
-            // Calculate G-Force
-            val gForce = sqrt((gX * gX + gY * gY + gZ * gZ).toDouble()).toFloat()
+            if (matchesName || matchesClass) return root
+        } catch (_: Exception) {}
 
-            if (gForce > SHAKE_THRESHOLD_GRAVITY) {
-                val now = System.currentTimeMillis()
-                // Ignore shakes that happen too close together
-                if (mShakeTimestamp + SHAKE_SLOP_TIME_MS > now) {
-                    return
-                }
-                mShakeTimestamp = now
-
-                // Trigger the Settings Menu
-                val decorView = activity.window.decorView
-                decorView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                SettingsSheet.show(activity, decorView)
+        if (root is ViewGroup) {
+            for (i in 0 until root.childCount) {
+                val child = root.getChildAt(i)
+                val found = findHomeTab(child)
+                if (found != null) return found
             }
         }
-
-        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
-            // Unused
-        }
+        return null
     }
 }
 
