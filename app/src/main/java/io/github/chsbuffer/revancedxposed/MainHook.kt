@@ -19,6 +19,7 @@ import io.github.chsbuffer.revancedxposed.spotify.SettingsSheet
 import io.github.chsbuffer.revancedxposed.spotify.SpotifyHook
 import io.github.chsbuffer.revancedxposed.spotify.ThemeHook
 import java.util.WeakHashMap
+import android.view.KeyEvent
 // ...existing imports...
 
 class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
@@ -32,6 +33,11 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     // Keep track of the anchor view (home tab) so we can remove the listener when the app pauses
     private val anchorViews = WeakHashMap<Activity, View>()
+    // Track last volume key press times to detect simultaneous press
+    private val lastVolUp = WeakHashMap<Activity, Long>()
+    private val lastVolDown = WeakHashMap<Activity, Long>()
+    // Cooldown to avoid retriggering repeatedly
+    private val lastTrigger = WeakHashMap<Activity, Long>()
 
     fun shouldHook(packageName: String): Boolean {
         if (!hooksByPackage.containsKey(packageName)) return false
@@ -101,6 +107,50 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     if (anchor != null) {
                         anchor.setOnLongClickListener(null)
                         anchorViews.remove(activity)
+                    }
+                }
+            }
+        )
+
+        // --- VOLUME KEYS: Detect simultaneous Volume Up + Volume Down press ---
+        XposedHelpers.findAndHookMethod(
+            "android.app.Activity",
+            lpparam.classLoader,
+            "dispatchKeyEvent",
+            KeyEvent::class.java,
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val activity = param.thisObject as Activity
+                    if (!activity.javaClass.name.contains("MainActivity")) return
+
+                    val ev = param.args[0] as KeyEvent
+                    if (ev.action != KeyEvent.ACTION_DOWN) return
+
+                    val now = System.currentTimeMillis()
+                    val threshold = 400L // ms between presses to consider simultaneous
+
+                    when (ev.keyCode) {
+                        KeyEvent.KEYCODE_VOLUME_UP -> {
+                            lastVolUp[activity] = now
+                            val d = lastVolDown[activity] ?: 0L
+                            val last = lastTrigger[activity] ?: 0L
+                            if (now - d <= threshold && now - last > 1000L) {
+                                triggerSettings(activity)
+                                lastTrigger[activity] = now
+                                param.setResult(true)
+                            }
+                        }
+                        KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                            lastVolDown[activity] = now
+                            val u = lastVolUp[activity] ?: 0L
+                            val last = lastTrigger[activity] ?: 0L
+                            if (now - u <= threshold && now - last > 1000L) {
+                                triggerSettings(activity)
+                                lastTrigger[activity] = now
+                                param.setResult(true)
+                            }
+                        }
+                        else -> return
                     }
                 }
             }
@@ -196,6 +246,14 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             }
         }
         return null
+    }
+
+    private fun triggerSettings(activity: Activity) {
+        try {
+            val anchor = anchorViews[activity] ?: activity.window.decorView
+            anchor.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            SettingsSheet.show(activity, anchor)
+        } catch (_: Exception) {}
     }
 }
 
