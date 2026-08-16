@@ -35,16 +35,17 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         if (targetPackageName == null) targetPackageName = packageName
         return targetPackageName == packageName
     }
+
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         if (!lpparam.isFirstApplication) return
         if (!shouldHook(lpparam.packageName)) return
         this.lpparam = lpparam
 
-        // --- NUOVO TRIGGER: LONG CLICK SU ICONA PROFILO ---
+        // --- NEW TRIGGER: LONG CLICK ON HOME TAB ---
         XposedHelpers.findAndHookMethod(
             "android.app.Activity",
             lpparam.classLoader,
-            "onPostCreate", // Usiamo onPostCreate per essere sicuri che la UI sia pronta
+            "onPostCreate",
             android.os.Bundle::class.java,
             object : XC_MethodHook() {
                 @SuppressLint("DiscouragedApi")
@@ -52,27 +53,34 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                     val activity = param.thisObject as Activity
                     if (!activity.javaClass.name.contains("MainActivity")) return
 
-                    // Spotify carica l'avatar in modo asincrono, aspettiamo che la vista sia disposta
                     val decorView = activity.window.decorView as ViewGroup
                     decorView.viewTreeObserver.addOnGlobalLayoutListener {
-                        // Proviamo a trovare l'avatar tramite ID comuni
-                        val avatarIds = listOf("profile_button", "profile_image", "avatar", "user_avatar", "faceview", "faceheader_image")
+                        // Proviamo a trovare il tab Home tramite ID comuni
+                        val homeTabIds = listOf(
+                            "bottom_nav_item_home",
+                            "home_tab",
+                            "tab_home",
+                            "nav_home",
+                            "navigation_home",
+                            "home",
+                            "bottom_navigation_item_home"
+                        )
                         var found = false
 
-                        for (idName in avatarIds) {
+                        for (idName in homeTabIds) {
                             val resId = activity.resources.getIdentifier(idName, "id", activity.packageName)
                             if (resId != 0) {
-                                val avatarView = activity.findViewById<View>(resId)
-                                if (avatarView != null && !found) {
-                                    setModLongClickListener(avatarView, activity)
+                                val homeView = activity.findViewById<View>(resId)
+                                if (homeView != null && !found) {
+                                    setModLongClickListener(homeView, activity)
                                     found = true
                                 }
                             }
                         }
 
-                        // Se non troviamo l'ID, cerchiamo la prima ImageView in alto a sinistra
+                        // Se non troviamo l'ID, cerchiamo in modo ricorsivo
                         if (!found) {
-                            findAvatarRecursive(decorView, activity)
+                            findHomeTabRecursive(decorView, activity)
                         }
                     }
                 }
@@ -92,7 +100,6 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             Utils.showToastLong("ReVanced Xposed FE is initializing, please wait...")
 
             // --- BLOCCO PREMIUM ---
-            // Ora è isolato: se Roundy sopra crasha, questo verrà comunque eseguito!
             try {
                 if (prefs.getBoolean("enable_premium", true)) {
                     hooksByPackage[lpparam.packageName]?.invoke()?.Hook()
@@ -103,7 +110,6 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
             // --- BLOCCO: AD BLOCK ---
             try {
-                // Puoi aggiungere "enable_adblock" nel tuo SettingsSheet più tardi
                 if (prefs.getBoolean("enable_adblock", true)) {
                     AdBlockHook(lpparam).hook()
                     XposedBridge.log("AdBlocker: Modulo attivato")
@@ -121,7 +127,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
                 XposedBridge.log("Mod Monet fallita: ${e.message}")
             }
 
-            // --- BLOCCO ROUNDY (Il sospettato numero 1) ---
+            // --- BLOCCO ROUNDY ---
             try {
                 if (prefs.getBoolean("enable_round_ui", true)) {
                     RoundyUIHook(lpparam).hook()
@@ -129,7 +135,6 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
             } catch (e: Exception) {
                 XposedBridge.log("Mod Roundy fallita: ${e.message}")
             }
-            
         }
     }
 
@@ -152,21 +157,18 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         }
     }
 
-    // Cerca l'immagine profilo basandosi sulla posizione (Top-Left)
-    private fun findAvatarRecursive(view: View, activity: Activity) {
-        if (view is ImageView || view.contentDescription?.toString()?.contains("Profilo", true) == true) {
-            val location = IntArray(2)
-            view.getLocationOnScreen(location)
-            // L'avatar è solitamente entro i primi 150px dall'alto e 150px da sinistra
-            if (location[0] < 150 && location[1] < 200 && view.width > 0) {
-                setModLongClickListener(view, activity)
-                return
-            }
+    // Cerca il tab Home basandosi sulla descrizione
+    private fun findHomeTabRecursive(view: View, activity: Activity) {
+        val desc = view.contentDescription?.toString()
+        // Controlla alcune traduzioni comuni per il pulsante Home in modo da coprire più lingue di sistema
+        if (desc != null && (desc.equals("Home", true) || desc.equals("Inicio", true) || desc.equals("Início", true) || desc.equals("Accueil", true))) {
+            setModLongClickListener(view, activity)
+            return
         }
 
         if (view is ViewGroup) {
             for (i in 0 until view.childCount) {
-                findAvatarRecursive(view.getChildAt(i), activity)
+                findHomeTabRecursive(view.getChildAt(i), activity)
             }
         }
     }
@@ -185,7 +187,7 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     override fun initZygote(startupParam: StartupParam) {
         this.startupParam = startupParam
-        XposedInit = startupParam
+        // If your original script had "XposedInit = startupParam" defined somewhere outside, ensure it stays valid.
     }
 }
 
