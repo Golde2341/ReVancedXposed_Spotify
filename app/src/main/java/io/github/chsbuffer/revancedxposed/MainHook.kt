@@ -3,9 +3,13 @@ package io.github.chsbuffer.revancedxposed
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Application
+import android.content.Context
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
+import android.view.HapticFeedbackConstants
 import android.view.View
-import android.view.ViewGroup
-import android.widget.ImageView
 import app.revanced.extension.shared.Utils
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.IXposedHookZygoteInit
@@ -19,7 +23,8 @@ import io.github.chsbuffer.revancedxposed.spotify.RoundyUIHook
 import io.github.chsbuffer.revancedxposed.spotify.SettingsSheet
 import io.github.chsbuffer.revancedxposed.spotify.SpotifyHook
 import io.github.chsbuffer.revancedxposed.spotify.ThemeHook
-import androidx.core.view.isNotEmpty
+import java.util.WeakHashMap
+import kotlin.math.sqrt
 
 class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     lateinit var startupParam: StartupParam
@@ -29,6 +34,9 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
     val hooksByPackage = mapOf(
         "com.spotify.music" to { SpotifyHook(app, lpparam) },
     )
+
+    // Keep track of our sensor listeners so we can unregister them when the app pauses
+    private val shakeListeners = WeakHashMap<Activity, ShakeListener>()
 
     fun shouldHook(packageName: String): Boolean {
         if (!hooksByPackage.containsKey(packageName)) return false
@@ -41,47 +49,46 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         if (!shouldHook(lpparam.packageName)) return
         this.lpparam = lpparam
 
-        // --- NEW TRIGGER: LONG CLICK ON HOME TAB ---
+        // --- SHAKE TRIGGER: Register listener onResume ---
         XposedHelpers.findAndHookMethod(
             "android.app.Activity",
             lpparam.classLoader,
-            "onPostCreate",
-            android.os.Bundle::class.java,
+            "onResume",
             object : XC_MethodHook() {
-                @SuppressLint("DiscouragedApi")
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val activity = param.thisObject as Activity
                     if (!activity.javaClass.name.contains("MainActivity")) return
 
-                    val decorView = activity.window.decorView as ViewGroup
-                    decorView.viewTreeObserver.addOnGlobalLayoutListener {
-                        // Proviamo a trovare il tab Home tramite ID comuni
-                        val homeTabIds = listOf(
-                            "bottom_nav_item_home",
-                            "home_tab",
-                            "tab_home",
-                            "nav_home",
-                            "navigation_home",
-                            "home",
-                            "bottom_navigation_item_home"
-                        )
-                        var found = false
+                    val sensorManager = activity.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+                    val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
 
-                        for (idName in homeTabIds) {
-                            val resId = activity.resources.getIdentifier(idName, "id", activity.packageName)
-                            if (resId != 0) {
-                                val homeView = activity.findViewById<View>(resId)
-                                if (homeView != null && !found) {
-                                    setModLongClickListener(homeView, activity)
-                                    found = true
-                                }
-                            }
+                    if (accelerometer != null) {
+                        var listener = shakeListeners[activity]
+                        if (listener == null) {
+                            listener = ShakeListener(activity)
+                            shakeListeners[activity] = listener
                         }
+                        // SENSOR_DELAY_UI is responsive enough for a shake without killing the battery
+                        sensorManager.registerListener(listener, accelerometer, SensorManager.SENSOR_DELAY_UI)
+                    }
+                }
+            }
+        )
 
-                        // Se non troviamo l'ID, cerchiamo in modo ricorsivo
-                        if (!found) {
-                            findHomeTabRecursive(decorView, activity)
-                        }
+        // --- SHAKE TRIGGER: Unregister listener onPause ---
+        XposedHelpers.findAndHookMethod(
+            "android.app.Activity",
+            lpparam.classLoader,
+            "onPause",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val activity = param.thisObject as Activity
+                    if (!activity.javaClass.name.contains("MainActivity")) return
+
+                    val listener = shakeListeners[activity]
+                    if (listener != null) {
+                        val sensorManager = activity.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+                        sensorManager.unregisterListener(listener)
                     }
                 }
             }
@@ -138,41 +145,6 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
         }
     }
 
-    // Funzione per impostare il listener e dare feedback
-    private fun setModLongClickListener(view: View, activity: Activity) {
-        if (view.tag == "mod_hooked") return
-        view.tag = "mod_hooked"
-
-        view.setOnLongClickListener {
-            // Se la view cliccata è un contenitore (ViewGroup), cerchiamo l'immagine dentro
-            val realView = if (it is ViewGroup && it.isNotEmpty()) {
-                it.getChildAt(0)
-            } else {
-                it
-            }
-
-            it.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
-            SettingsSheet.show(activity, realView)
-            true
-        }
-    }
-
-    // Cerca il tab Home basandosi sulla descrizione
-    private fun findHomeTabRecursive(view: View, activity: Activity) {
-        val desc = view.contentDescription?.toString()
-        // Controlla alcune traduzioni comuni per il pulsante Home in modo da coprire più lingue di sistema
-        if (desc != null && (desc.equals("Home", true) || desc.equals("Inicio", true) || desc.equals("Início", true) || desc.equals("Accueil", true))) {
-            setModLongClickListener(view, activity)
-            return
-        }
-
-        if (view is ViewGroup) {
-            for (i in 0 until view.childCount) {
-                findHomeTabRecursive(view.getChildAt(i), activity)
-            }
-        }
-    }
-
     private fun isReVancedPatched(lpparam: LoadPackageParam): Boolean {
         return runCatching {
             lpparam.classLoader.loadClass("app.revanced.extension.shared.Utils")
@@ -187,7 +159,45 @@ class MainHook : IXposedHookLoadPackage, IXposedHookZygoteInit {
 
     override fun initZygote(startupParam: StartupParam) {
         this.startupParam = startupParam
-        // If your original script had "XposedInit = startupParam" defined somewhere outside, ensure it stays valid.
+    }
+
+    // --- CLASSE SHAKE LISTENER ---
+    private class ShakeListener(private val activity: Activity) : SensorEventListener {
+        // Adjust this threshold to make the shake more or less sensitive (2.7f is standard)
+        private val SHAKE_THRESHOLD_GRAVITY = 2.7f
+        private val SHAKE_SLOP_TIME_MS = 1000 // 1 second cooldown between shakes
+        private var mShakeTimestamp: Long = 0
+
+        override fun onSensorChanged(event: SensorEvent) {
+            val x = event.values[0]
+            val y = event.values[1]
+            val z = event.values[2]
+
+            val gX = x / SensorManager.GRAVITY_EARTH
+            val gY = y / SensorManager.GRAVITY_EARTH
+            val gZ = z / SensorManager.GRAVITY_EARTH
+
+            // Calculate G-Force
+            val gForce = sqrt((gX * gX + gY * gY + gZ * gZ).toDouble()).toFloat()
+
+            if (gForce > SHAKE_THRESHOLD_GRAVITY) {
+                val now = System.currentTimeMillis()
+                // Ignore shakes that happen too close together
+                if (mShakeTimestamp + SHAKE_SLOP_TIME_MS > now) {
+                    return
+                }
+                mShakeTimestamp = now
+
+                // Trigger the Settings Menu
+                val decorView = activity.window.decorView
+                decorView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                SettingsSheet.show(activity, decorView)
+            }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+            // Unused
+        }
     }
 }
 
